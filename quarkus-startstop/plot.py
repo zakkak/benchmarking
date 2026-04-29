@@ -114,17 +114,13 @@ num_metrics = len(metrics)
 subplot_titles = []
 for test_idx, test in enumerate(test_names):
     for metric_idx, metric in enumerate(metrics):
-        if test_idx == 0:
-            # First row: show metric title
-            subplot_titles.append(metric[2])
-        else:
-            # Other rows: no title
-            subplot_titles.append("")
+        # First row: show metric title
+        subplot_titles.append(metric[2])
 
 fig = make_subplots(
     rows=num_tests, cols=num_metrics,
     subplot_titles=subplot_titles,
-    vertical_spacing=0.20,
+    vertical_spacing=0.30,
     horizontal_spacing=0.05,
     specs=[[{"type": "violin"} for _ in range(num_metrics)] for _ in range(num_tests)],
     row_titles=test_names
@@ -163,7 +159,7 @@ for test_idx, test_name in enumerate(test_names, start=1):
 # Update overall layout
 fig.update_layout(
     title_text="Quarkus StartStop Native Tests Performance Comparison",
-    height=500 * num_tests,
+    height=550 * num_tests,
     width=450 * num_metrics,
     showlegend=True,
     legend=dict(
