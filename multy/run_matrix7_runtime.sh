@@ -21,6 +21,7 @@ DIR_APP3="$HOME/code/quarkus-quickstarts/hibernate-orm-quickstart"
 # --- Optimal spread by Google Gemini + Intel manual
 CPU_SET_NATIVE="4-7"       # P-Cores for Quarkus Application
 CPU_SET_ECORES="11-15"     # E-Cores for Databases
+CPU_SET_PROBE="8-10"       # Dedicated cores for readiness probes
 
 XML_PAYLOAD="/tmp/10-employee-profiles-test.xml"
 RUN_COUNT=${RUN_COUNT:-10}
@@ -245,8 +246,8 @@ run_matrix_job() {
         if [ "$APP_ID" = "hibernate-orm-quickstart" ]; then start_dbs_app3; fi
 
         # run and measure application
-        local ttfr_cold_ms=-1
-        local min_ttfr_ms=-1
+        local ttfr_cold_ns=-1
+        local min_ttfr_ns=-1
         local min_rss_mb=-1
         local out_payload="$RESULTS_DIR/response_${job_label}_${APP_ID}.out"
         local app_log="$RESULTS_DIR/app_run_${job_label}_${APP_ID}.log"
@@ -257,53 +258,82 @@ run_matrix_job() {
 
         for (( i=1; i<=RUN_COUNT; i++ )); do
             sudo ~/bin/bmark-setup drop-caches
+
+            local ttfr_ns=-1
+            local timeout_sec=60
+            local deadline_sec=$((SECONDS + timeout_sec))
+            local http_code=000
+            local response_valid=false
+            local -a probe_cmd=()
+
+            # Build the full probe command once per cycle (outside the retry while-loop).
+
+            # Precompute request metadata once per app to keep retry loop lean.
+            local probe_expected_http=""
+
+            if [ "$APP_ID" = "mp-orm-dbs-awt" ]; then
+                probe_cmd=(taskset -c "$CPU_SET_PROBE" curl -s -o "$out_payload" -w "%{http_code}" -X POST \
+                    -H "Content-Type: application/xml" -d @"$XML_PAYLOAD" "http://127.0.0.1:8080/perfMeshup")
+                probe_expected_http="200"
+            elif [ "$APP_ID" = "validation-quickstart" ]; then
+                probe_cmd=(taskset -c "$CPU_SET_PROBE" curl -s -o "$out_payload" -w "%{http_code}" -X POST \
+                    -H "Content-Type: application/json" -d '{"title": "some book", "author": "me", "pages":5}' "http://127.0.0.1:8080/books/service-method-validation")
+                probe_expected_http="200"
+            elif [ "$APP_ID" = "hibernate-orm-quickstart" ]; then
+                probe_cmd=(taskset -c "$CPU_SET_PROBE" curl -s -o "$out_payload" -w "%{http_code}" -X POST \
+                    -H "Content-Type: application/json" -d "{\"name\" : \"Pear${i}\"}" "http://127.0.0.1:8080/fruits")
+                probe_expected_http="201"
+            fi
+
             local start_time_ns=$(date +%s%N)
 
             taskset -c "$CPU_SET_NATIVE" "$runner_file" $app_run_args > "$app_log" 2>&1 &
             APP_PID=$!
 
-            local ttfr_ms=-1
-            local timeout_sec=60
-            local start_time_sec=$(date +%s)
-
             while true; do
-                local http_code=000
+                # Execute prebuilt probe command to avoid per-iteration command construction.
+                http_code=$("${probe_cmd[@]}")
 
-                # dynamic curl & validation based on app
-                if [ "$APP_ID" = "mp-orm-dbs-awt" ]; then
-                    http_code=$(curl -s -o "$out_payload" -w "%{http_code}" -X POST \
-                        -H "Content-Type: application/xml" -d @"$XML_PAYLOAD" \
-                        http://127.0.0.1:8080/perfMeshup)
-                    if [ "$http_code" = "200" ] && [ -s "$out_payload" ] && file "$out_payload" | grep -qi "pdf document"; then break; fi
-
-                elif [ "$APP_ID" = "validation-quickstart" ]; then
-                    http_code=$(curl -s -o "$out_payload" -w "%{http_code}" -X POST \
-                        -H "Content-Type: application/json" -d '{"title": "some book", "author": "me", "pages":5}' \
-                        http://127.0.0.1:8080/books/service-method-validation)
-                    if [ "$http_code" = "200" ] && grep -qi '"success":true' "$out_payload"; then break; fi
-
-                elif [ "$APP_ID" = "hibernate-orm-quickstart" ]; then
-                    # appends the cycle index '$i' to avoid duplicate keys...
-                    http_code=$(curl -s -o "$out_payload" -w "%{http_code}" -X POST \
-                        -H "Content-Type: application/json" -d "{\"name\" : \"Pear${i}\"}" \
-                        http://127.0.0.1:8080/fruits)
-                    if [ "$http_code" = "201" ] && grep -qi "\"name\":\"Pear${i}\"" "$out_payload"; then break; fi
+                if [ "$http_code" = "$probe_expected_http" ]; then
+                    break;
                 fi
 
-                local current_time_sec=$(date +%s)
-                if [ $(( current_time_sec - start_time_sec )) -gt $timeout_sec ]; then
+                if (( SECONDS > deadline_sec )); then
                     echo "ERROR Timeout waiting for response on cycle $i."
                     cat "$app_log"
                     break
                 fi
-                sleep 0.001
             done
 
             if [ "$http_code" = "200" ] || [ "$http_code" = "201" ]; then
                 local end_time_ns=$(date +%s%N)
-                ttfr_ms=$(( (end_time_ns - start_time_ns) / 1000000 ))
+                ttfr_ns=$(( end_time_ns - start_time_ns ))
+
+                # Validate payload once, outside the retry loop to avoid extra probe overhead.
+                if [ "$APP_ID" = "mp-orm-dbs-awt" ]; then
+                    if [ -s "$out_payload" ] && file "$out_payload" | grep -qi "pdf document"; then
+                        response_valid=true
+                    fi
+                elif [ "$APP_ID" = "validation-quickstart" ]; then
+                    if grep -qi '"success":true' "$out_payload"; then
+                        response_valid=true
+                    fi
+                elif [ "$APP_ID" = "hibernate-orm-quickstart" ]; then
+                    if grep -qi "\"name\":\"Pear${i}\"" "$out_payload"; then
+                        response_valid=true
+                    fi
+                fi
+
+                if [ "$response_valid" = false ]; then
+                    echo "ERROR: Post-success payload validation failed on cycle $i (status=$http_code)."
+                    ttfr_ns=-1
+                fi
             fi
 
+            local ttfr_ms=-1
+            if [ "$ttfr_ns" -gt 0 ]; then
+                ttfr_ms=$(( ttfr_ns / 1000000 ))
+            fi
             echo I=$i TTFR=$ttfr_ms
 
             sleep 10 # wait for RSS stabilization
@@ -312,9 +342,9 @@ run_matrix_job() {
             local rss_mb=$(awk -v r="$rss_kb" 'BEGIN {printf "%.2f", r / 1024}')
 
             # update minimums, we take the best
-            if [ "$ttfr_ms" -gt 0 ]; then
-                if [ "$i" -eq 1 ]; then ttfr_cold_ms=$ttfr_ms; fi
-                if [ "$min_ttfr_ms" -eq -1 ] || [ "$ttfr_ms" -lt "$min_ttfr_ms" ]; then min_ttfr_ms=$ttfr_ms; fi
+            if [ "$ttfr_ns" -gt 0 ]; then
+                if [ "$i" -eq 1 ]; then ttfr_cold_ns=$ttfr_ns; fi
+                if [ "$min_ttfr_ns" -eq -1 ] || [ "$ttfr_ns" -lt "$min_ttfr_ns" ]; then min_ttfr_ns=$ttfr_ns; fi
             fi
 
             if [ $(awk -v r="$rss_kb" 'BEGIN {print (r > 0 ? 1 : 0)}') -eq 1 ]; then
@@ -329,6 +359,11 @@ run_matrix_job() {
             echo -e "${APP_ID}\t${ttfr_ms}\t${rss_mb}" >> "$metrics_all_tsv"
 
         done
+
+        local ttfr_cold_ms=-1
+        local min_ttfr_ms=-1
+        if [ "$ttfr_cold_ns" -gt 0 ]; then ttfr_cold_ms=$(( ttfr_cold_ns / 1000000 )); fi
+        if [ "$min_ttfr_ns" -gt 0 ]; then min_ttfr_ms=$(( min_ttfr_ns / 1000000 )); fi
 
         stop_dbs
         # Google Gemini formatter
