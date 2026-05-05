@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+
+# TUNED FOR AMD 7950X
+
+# set -x
+
+usage() {
+    echo "Usage: $(basename "$0") {start|stop|drop-caches}"
+    exit 1
+}
+
+case "${1}" in
+    start)
+        # Switch to performance governor so the CPU runs at max non-boost frequency
+        cpupower frequency-set -g performance
+        # Disable turbo boost — boost clocks vary with thermals, power budget,
+        # and active core count, which hurts reproducibility
+        echo 0 > /sys/devices/system/cpu/cpufreq/boost
+        # Pin all cores to the nominal 4.5 GHz (Ryzen 9 7950X base clock);
+        # setting min and max separately works around amd-pstate-epp rejecting
+        # simultaneous -d/-u when the new range conflicts with the current one
+        cpupower frequency-set --min 4.5GHz
+        cpupower frequency-set --max 4.5GHz
+        # With amd-pstate-epp + performance governor, EPP is automatically
+        # locked to "performance" — no manual write needed
+        # Disable deep C-states (C2, C3) to reduce wakeup latency; keep POLL and C1
+        echo 1 | tee /sys/devices/system/cpu/cpu*/cpuidle/state2/disable > /dev/null
+        echo 1 | tee /sys/devices/system/cpu/cpu*/cpuidle/state3/disable > /dev/null
+        # Reduce dirty page writeback thresholds for lower I/O latency
+        sysctl -q vm.dirty_ratio=10 vm.dirty_background_ratio=3
+        # Lower swappiness to discourage swapping out process memory
+        sysctl -q vm.swappiness=10
+        # Allow unprivileged access to perf events (1 = kernel+user, no raw tracepoints)
+        echo 1 > /proc/sys/kernel/perf_event_paranoid
+        # Expose kernel symbol addresses in /proc/kallsyms to all users
+        echo 0 > /proc/sys/kernel/kptr_restrict
+        # Disable Address Space Layout Randomization (ASLR) for reproducible addresses
+        echo 0 > /proc/sys/kernel/randomize_va_space
+        # Disable scheduler autogroup so all benchmark threads compete fairly
+        # in the global CFS run queue instead of per-TTY groups
+        sysctl -q kernel.sched_autogroup_enabled=0
+        # Disable Transparent Huge Pages — khugepaged compaction and defrag
+        # cause unpredictable latency spikes during allocation
+        echo never > /sys/kernel/mm/transparent_hugepage/enabled
+        echo never > /sys/kernel/mm/transparent_hugepage/defrag
+        # Stop irqbalance to prevent IRQ migration between CPUs mid-run
+        systemctl stop irqbalance 2>/dev/null || true
+        # Disable NMI watchdog — its periodic interrupts add measurement noise
+        sysctl -q kernel.nmi_watchdog=0
+        # Disable NUMA balancing — the 7950X has 2 CCDs (often NUMA nodes);
+        # automatic page migration between them adds variance
+        sysctl -q kernel.numa_balancing=0
+        # Disable timer migration to prevent timers from moving to busy CPUs
+        # and causing unexpected wakeups
+        sysctl -q kernel.timer_migration=0
+        # Disable SMT (hyperthreading) to eliminate sibling-thread interference;
+        # halves thread count but greatly reduces core-level contention jitter
+        echo off > /sys/devices/system/cpu/smt/control
+        # Disable Kernel Samepage Merging — its background scanning adds CPU noise
+        echo 0 > /sys/kernel/mm/ksm/run
+        # Print current CPU frequencies to confirm the governor change took effect
+        grep -E '^cpu MHz' /proc/cpuinfo
+        echo "ready to start!"
+        ;;
+    stop)
+        # Re-enable SMT (hyperthreading) first so all CPUs are online
+        # before setting frequency/governor on them
+        echo on > /sys/devices/system/cpu/smt/control
+        # Re-enable turbo boost
+        echo 1 > /sys/devices/system/cpu/cpufreq/boost
+        # Restore powersave governor (the amd-pstate-epp default); this
+        # lets the firmware manage frequency and unlocks EPP writes
+        cpupower frequency-set -g powersave
+        # Restore the full hardware frequency range (set separately for amd-pstate-epp)
+        cpupower frequency-set --min 425MHz
+        cpupower frequency-set --max 5883MHz
+        # Restore energy performance preference to balance_performance
+        # (writable now that governor is powersave)
+        echo balance_performance | tee /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference > /dev/null
+        # Re-enable deep C-states (C2, C3)
+        echo 0 | tee /sys/devices/system/cpu/cpu*/cpuidle/state2/disable > /dev/null
+        echo 0 | tee /sys/devices/system/cpu/cpu*/cpuidle/state3/disable > /dev/null
+        # Restore default dirty page writeback thresholds and swappiness
+        sysctl -q vm.dirty_ratio=20 vm.dirty_background_ratio=10 vm.swappiness=60
+        # Re-enable scheduler autogroup (desktop behavior)
+        sysctl -q kernel.sched_autogroup_enabled=1
+        # Re-enable ASLR (2 = full randomization)
+        echo 2 > /proc/sys/kernel/randomize_va_space
+        # Re-enable Transparent Huge Pages
+        echo always > /sys/kernel/mm/transparent_hugepage/enabled
+        echo always > /sys/kernel/mm/transparent_hugepage/defrag
+        # Restart irqbalance for normal IRQ distribution
+        systemctl start irqbalance 2>/dev/null || true
+        # Re-enable NMI watchdog
+        sysctl -q kernel.nmi_watchdog=1
+        # Re-enable NUMA balancing
+        sysctl -q kernel.numa_balancing=1
+        # Re-enable timer migration
+        sysctl -q kernel.timer_migration=1
+        # Re-enable Kernel Samepage Merging
+        echo 1 > /sys/kernel/mm/ksm/run
+        # Print current CPU frequencies to confirm the governor reverted
+        grep -E '^cpu MHz' /proc/cpuinfo
+        ;;
+    drop-caches)
+        # Safely drop caches without breaking zram swap
+        # This is a workaround for kernel 6.19.9 + zram-generator issue where
+        # drop_caches can leave zram in a "busy" state that prevents suspend
+        echo "Disabling swap..."
+        swapoff -a
+        echo "Dropping caches (page cache, dentries, and inodes)..."
+        sync
+        echo 3 > /proc/sys/vm/drop_caches
+        echo "Re-enabling swap..."
+        swapon -a
+        echo "Caches dropped successfully!"
+        ;;
+    *)
+        usage
+        ;;
+esac
